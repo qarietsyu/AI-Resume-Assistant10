@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import time
 from io import BytesIO
 
 import streamlit as st
@@ -14,6 +15,8 @@ from pypdf import PdfReader
 DEFAULT_MODEL = "gemini-3.8-flash"
 MAX_RESUME_CHARS = 20000
 MIN_RESUME_CHARS = 150
+RETRY_CODES = {429, 500, 502, 503, 504}  # temporary errors worth retrying
+RETRY_DELAYS = [2, 5, 10]  # seconds to wait between attempts
 
 SYSTEM_PROMPT = """You are an expert ATS (Applicant Tracking System) analyst and senior recruiter.
 Evaluate the resume text provided and return ONLY a valid JSON object, with no markdown and no commentary.
@@ -107,6 +110,17 @@ def parse_json(text: str) -> dict:
         raise
 
 
+def get_setting(name: str, default=None):
+    """Read a setting from Streamlit secrets first, then environment variables."""
+    try:
+        val = st.secrets.get(name)
+        if val:
+            return val
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
 def clamp(value, default=0) -> int:
     try:
         return max(0, min(100, int(round(float(value)))))
@@ -114,7 +128,8 @@ def clamp(value, default=0) -> int:
         return default
 
 
-def analyze_resume(resume_text: str, job_description: str, api_key: str, model: str) -> dict:
+def analyze_resume(resume_text: str, job_description: str, api_key: str, model: str,
+                   fallback_model: str = None) -> dict:
     client = genai.Client(api_key=api_key)
     user_content = f"RESUME TEXT:\n\"\"\"\n{resume_text[:MAX_RESUME_CHARS]}\n\"\"\"\n\n"
     if job_description.strip():
@@ -122,16 +137,34 @@ def analyze_resume(resume_text: str, job_description: str, api_key: str, model: 
     else:
         user_content += "JOB DESCRIPTION: (not provided)\n"
 
-    response = client.models.generate_content(
-        model=model,
-        contents=user_content,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        temperature=0.2,
+        response_mime_type="application/json",
     )
-    return parse_json(response.text)
+
+    models = [model] + ([fallback_model] if fallback_model and fallback_model != model else [])
+    last_error = None
+    for idx, name in enumerate(models):
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                response = client.models.generate_content(
+                    model=name, contents=user_content, config=config
+                )
+                return parse_json(response.text)
+            except json.JSONDecodeError as e:
+                last_error = e
+                break  # bad output: retrying the same call rarely helps, try next model
+            except Exception as e:
+                last_error = e
+                code = getattr(e, "code", None)
+                if code in RETRY_CODES and attempt < len(RETRY_DELAYS):
+                    time.sleep(RETRY_DELAYS[attempt])
+                    continue
+                if idx == 0 and len(models) > 1:
+                    break  # primary failed: move on to the fallback model
+                raise
+    raise last_error
 
 
 # ---------- UI ----------
@@ -216,7 +249,8 @@ def main():
     st.caption("Upload your resume to get an ATS score and specific ways to improve it.")
 
     api_key = get_api_key()
-    model = os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
+    model = get_setting("GEMINI_MODEL", DEFAULT_MODEL)
+    fallback_model = get_setting("GEMINI_FALLBACK_MODEL")
     if not api_key:
         st.error(
             "Gemini API key not found. Add `GEMINI_API_KEY` to Streamlit secrets "
@@ -242,7 +276,7 @@ def main():
                 )
                 st.stop()
             with st.spinner("Analyzing with Gemini..."):
-                result = analyze_resume(text, job_description, api_key, model)
+                result = analyze_resume(text, job_description, api_key, model, fallback_model)
             st.session_state["result"] = result
         except ValueError as e:
             st.error(str(e))
@@ -251,7 +285,14 @@ def main():
             st.error("The AI returned an unreadable response. Please try again.")
             st.stop()
         except Exception as e:
-            st.error(f"Something went wrong: {e}")
+            code = getattr(e, "code", None)
+            if code in RETRY_CODES:
+                st.error(
+                    "The AI model is busy right now (high demand). Please wait a minute and "
+                    "click Analyze again."
+                )
+            else:
+                st.error(f"Something went wrong: {e}")
             st.stop()
 
     if "result" in st.session_state:
