@@ -13,6 +13,8 @@ from google.genai import types
 from pypdf import PdfReader
 
 DEFAULT_MODEL = "gemini-3.8-flash"
+# Tried in order if the main model keeps failing (names from Google's model list)
+DEFAULT_FALLBACKS = ["gemini-3.7-flash", "gemini-3.5-flash-lite"]
 MAX_RESUME_CHARS = 20000
 MIN_RESUME_CHARS = 150
 RETRY_CODES = {429, 500, 502, 503, 504}  # temporary errors worth retrying
@@ -129,7 +131,9 @@ def clamp(value, default=0) -> int:
 
 
 def analyze_resume(resume_text: str, job_description: str, api_key: str, model: str,
-                   fallback_model: str = None) -> dict:
+                   fallback_models=None) -> dict:
+    if isinstance(fallback_models, str):
+        fallback_models = [m.strip() for m in fallback_models.split(",") if m.strip()]
     client = genai.Client(api_key=api_key)
     user_content = f"RESUME TEXT:\n\"\"\"\n{resume_text[:MAX_RESUME_CHARS]}\n\"\"\"\n\n"
     if job_description.strip():
@@ -143,9 +147,14 @@ def analyze_resume(resume_text: str, job_description: str, api_key: str, model: 
         response_mime_type="application/json",
     )
 
-    models = [model] + ([fallback_model] if fallback_model and fallback_model != model else [])
+    models = []
+    for m in [model] + list(fallback_models or []):
+        if m and m not in models:
+            models.append(m)
+
     last_error = None
     for idx, name in enumerate(models):
+        is_last = idx == len(models) - 1
         for attempt in range(len(RETRY_DELAYS) + 1):
             try:
                 response = client.models.generate_content(
@@ -154,16 +163,19 @@ def analyze_resume(resume_text: str, job_description: str, api_key: str, model: 
                 return parse_json(response.text)
             except json.JSONDecodeError as e:
                 last_error = e
-                break  # bad output: retrying the same call rarely helps, try next model
+                break  # bad output: move on to the next model
             except Exception as e:
                 last_error = e
                 code = getattr(e, "code", None)
                 if code in RETRY_CODES and attempt < len(RETRY_DELAYS):
+                    # fewer retries on the main model when a backup exists, so users wait less
+                    if not is_last and attempt >= 1:
+                        break
                     time.sleep(RETRY_DELAYS[attempt])
                     continue
-                if idx == 0 and len(models) > 1:
-                    break  # primary failed: move on to the fallback model
-                raise
+                if is_last:
+                    raise
+                break  # try the next model
     raise last_error
 
 
@@ -250,7 +262,7 @@ def main():
 
     api_key = get_api_key()
     model = get_setting("GEMINI_MODEL", DEFAULT_MODEL)
-    fallback_model = get_setting("GEMINI_FALLBACK_MODEL")
+    fallback_models = get_setting("GEMINI_FALLBACK_MODEL") or DEFAULT_FALLBACKS
     if not api_key:
         st.error(
             "Gemini API key not found. Add `GEMINI_API_KEY` to Streamlit secrets "
@@ -276,7 +288,7 @@ def main():
                 )
                 st.stop()
             with st.spinner("Analyzing with Gemini..."):
-                result = analyze_resume(text, job_description, api_key, model, fallback_model)
+                result = analyze_resume(text, job_description, api_key, model, fallback_models)
             st.session_state["result"] = result
         except ValueError as e:
             st.error(str(e))
